@@ -16,7 +16,7 @@ contract MerkleAirdrop {
     address[] claimers;
     bytes32 private immutable I_MERKLE_ROOT;
     IERC20 private immutable I_AIRDROP_TOKEN;
-    mapping(address => bool claimed) private s_claimed;
+    mapping(address => bool claimed) private sClaimed;
 
     event Claimed(address indexed account, uint256 amount);
     constructor(bytes32 _merkleRoot, IERC20 airdropToken) {
@@ -26,29 +26,44 @@ contract MerkleAirdrop {
 
     function claim(address account, uint256 amount, bytes32[] calldata merkleProof) external {
         // check if the user has already claimed
-        if (s_claimed[account]) {
+        if (sClaimed[account]) {
             revert MerkleAirdrop__AlreadyClaimed();
         }
         // calculate using the account and amount, the hash -> leaf node
-        bytes32 leaf = keccak256(
-            bytes.concat(
-                keccak256(abi.encode(account, amount))
-            )
-        );
+        // Use inline assembly to compute the double-hash leaf node efficiently.
+        // This avoids the overhead of abi.encode (memory allocation + ABI encoding),
+        // bytes.concat (copy into a new bytes array), and the Solidity keccak256 wrapper.
+        //
+        // Equivalent Solidity: keccak256(bytes.concat(keccak256(abi.encode(account, amount))))
+        //
+        // Layout in scratch space (ptr = free memory pointer):
+        //   [ptr + 0x00 .. ptr + 0x1f] : account (address, padded to 32 bytes)
+        //   [ptr + 0x20 .. ptr + 0x3f] : amount  (uint256, 32 bytes)
+        // inner = keccak256(ptr, 0x40)  — first hash over the 64-byte packed encoding
+        // leaf  = keccak256(ptr, 0x20)  — second hash over the 32-byte inner hash
+        bytes32 leaf;
+        assembly {
+            let ptr := mload(0x40)          // load free memory pointer
+            mstore(ptr, account)            // store address (zero-padded) at ptr
+            mstore(add(ptr, 0x20), amount)  // store amount right after
+            let inner := keccak256(ptr, 0x40)   // hash the 64-byte payload
+            mstore(ptr, inner)              // overwrite ptr with the inner hash
+            leaf := keccak256(ptr, 0x20)   // hash the 32-byte inner hash → leaf
+        }
         // Verify the merkle proof
         bool isValidLeaf = MerkleProof.verify(merkleProof, I_MERKLE_ROOT, leaf);
         if (!isValidLeaf) {
             revert MerkleAirdrop__InvalidProof();
         }
         // add the account to the claimed users
-        s_claimed[account] = true;
+        sClaimed[account] = true;
         emit Claimed(account, amount);
         // mint tokens to the claimer
         I_AIRDROP_TOKEN.safeTransfer(account, amount);
     }
 
     function isClaimed(address account) external view returns (bool) {
-        return s_claimed[account];
+        return sClaimed[account];
     }
 
     function getMerkleRoot() external view returns (bytes32) {
@@ -58,6 +73,6 @@ contract MerkleAirdrop {
     function getAirdropToken() external view returns (IERC20) {
         return I_AIRDROP_TOKEN;
     }
-    
-      
+
+
 }
